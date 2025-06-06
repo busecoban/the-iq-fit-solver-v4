@@ -1,6 +1,6 @@
-// iqfit_mpi.cpp
-// MPI-based parallel solver for the IQ-Fit puzzle (11×5 board, 12 pieces).
-// C++11 ile uyumlu hale getirildi, ayrıca çalışma süresi MPI_Wtime() ile ölçülür.
+// iqfit_mpi.cpp (Translated to English, with meaningful variable names and enhanced comments)
+// MPI-based parallel solver for the IQ-Fit puzzle (11x5 board, 12 unique pieces).
+// Each MPI rank explores a disjoint set of possible placements for the first piece.
 
 #include <mpi.h>
 #include <iostream>
@@ -11,143 +11,114 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
-#include <numeric>   // std::accumulate için
-#include <array>     // std::array kullanımı için
+#include <numeric>
+#include <array>
 
+// Board and puzzle parameters
 constexpr int BOARD_WIDTH = 11;
 constexpr int BOARD_HEIGHT = 5;
-constexpr int NUM_CELLS = BOARD_WIDTH * BOARD_HEIGHT; // 55
-constexpr int NUM_PIECES = 12;
+constexpr int TOTAL_CELLS = BOARD_WIDTH * BOARD_HEIGHT;
+constexpr int TOTAL_PIECES = 12;
 
-// Ham parça tanımları: her string "xy" biçiminde koordinatlardan oluşur
-static const std::vector<std::string> pieceShapes = {
-    "01 10 11 21 31",
-    "01 10 11 21 22",
-    "10 11 12 13 03",
-    "01 11 10 02",
-    "00 01 02 12 13",
-    "02 12 11 21 20",
-    "02 12 11 10",
-    "02 12 22 21 20",
-    "01 11 10",
-    "01 02 11 12 10",
-    "01 11 10 21",
-    "00 01 11 21 20"
+// Each shape string defines a base piece using "xy" format 
+static const std::vector<std::string> basePieceShapes = {
+    "01 10 11 21 31", "01 10 11 21 22", "10 11 12 13 03",
+    "01 11 10 02", "00 01 02 12 13", "02 12 11 21 20",
+    "02 12 11 10", "02 12 22 21 20", "01 11 10",
+    "01 02 11 12 10", "01 11 10 21", "00 01 11 21 20"
 };
 
-// Her parça p için: yerleşim maskeleri ve ilgili hücre indeksleri
-std::vector<std::vector<uint64_t>> placementMasks(NUM_PIECES);
-std::vector<std::vector<std::vector<int>>> placementCells(NUM_PIECES);
+// Precomputed bitmask placements for each piece and its variations
+std::vector<std::vector<uint64_t>> piecePlacementMasks(TOTAL_PIECES);
+// List of board cell indices covered by each valid placement
+std::vector<std::vector<std::vector<int>>> piecePlacementCells(TOTAL_PIECES);
+// For each piece and board cell: which placements cover that cell
+std::vector<std::vector<std::vector<int>>> piecePlacementsByCell(TOTAL_PIECES, std::vector<std::vector<int>>(TOTAL_CELLS));
 
-// Her parça p ve her hücre c için: c hücresini kapsayan yerleşim-indeksleri
-std::vector<std::vector<std::vector<int>>> placementsByCell(NUM_PIECES, std::vector<std::vector<int>>(NUM_CELLS));
+// Representation of the board as a 1D character array
+using BoardRepresentation = std::array<char, TOTAL_CELLS>;
 
-// Bir tahtanın karakter tamponu (55 hücre)
-using BoardChars = std::array<char, NUM_CELLS>;
-
-// Bir shape string'ini (örneğin "01 10 11 21 31") listeye çevirir
-static std::vector<std::pair<int,int>> parseShape(const std::string &s) {
-    std::vector<std::pair<int,int>> coords;
-    for (size_t i = 0; i + 1 < s.size(); i += 3) {
-        int x = s[i] - '0';
-        int y = s[i+1] - '0';
-        coords.emplace_back(x, y);
+// Parse a piece shape string into a list of coordinate pairs
+static std::vector<std::pair<int,int>> parsePieceShape(const std::string &shapeStr) {
+    std::vector<std::pair<int,int>> coordinates;
+    for (size_t i = 0; i + 1 < shapeStr.size(); i += 3) {
+        int x = shapeStr[i] - '0';
+        int y = shapeStr[i+1] - '0';
+        coordinates.emplace_back(x, y);
     }
-    return coords;
+    return coordinates;
 }
 
-// Bir base koordinat dizisinden (örneğin {(0,1),(1,0),...})
-// tüm benzersiz oryantasyonları üretir (rotasyon + yansıma)
-static std::vector<std::vector<std::pair<int,int>>> generateOrientations(const std::vector<std::pair<int,int>> &base) {
-    std::set<std::vector<std::pair<int,int>>> uniqueShapes;
-
+// Generate all unique orientations (rotations + reflections) of a piece
+static std::vector<std::vector<std::pair<int,int>>> generateUniqueOrientations(const std::vector<std::pair<int,int>> &baseCoords) {
+    std::set<std::vector<std::pair<int,int>>> uniqueOrientations;
     for (int reflect = 0; reflect < 2; ++reflect) {
         for (int rot = 0; rot < 4; ++rot) {
             std::vector<std::pair<int,int>> transformed;
-            // Önce yansıma (x ekseninde) uygula
-            for (const auto &p0 : base) {
-                int x0 = p0.first;
-                int y0 = p0.second;
-                int x = (reflect ? -x0 : x0);
-                int y = y0;
-                // Rotasyon rot kez 90° döndür
+            for (const auto &coord : baseCoords) {
+                int x = reflect ? -coord.first : coord.first;
+                int y = coord.second;
                 for (int r = 0; r < rot; ++r) {
-                    int tx = x;
+                    int temp = x;
                     x = y;
-                    y = -tx;
+                    y = -temp;
                 }
                 transformed.emplace_back(x, y);
             }
-            // Normalize et: min x,y = 0 olacak şekilde kaydır
+            // Normalize to top-left origin
             int minX = INT32_MAX, minY = INT32_MAX;
-            for (size_t i = 0; i < transformed.size(); ++i) {
-                minX = std::min(minX, transformed[i].first);
-                minY = std::min(minY, transformed[i].second);
+            for (const auto &p : transformed) {
+                minX = std::min(minX, p.first);
+                minY = std::min(minY, p.second);
             }
-            for (size_t i = 0; i < transformed.size(); ++i) {
-                transformed[i].first  -= minX;
-                transformed[i].second -= minY;
+            for (auto &p : transformed) {
+                p.first -= minX;
+                p.second -= minY;
             }
-            // Sıralayarak benzersizleştir
             std::sort(transformed.begin(), transformed.end());
-            uniqueShapes.insert(transformed);
+            uniqueOrientations.insert(transformed);
         }
     }
-
-    std::vector<std::vector<std::pair<int,int>>> result;
-    for (auto &shape : uniqueShapes) {
-        result.push_back(shape);
-    }
-    return result;
+    return std::vector<std::vector<std::pair<int,int>>>(uniqueOrientations.begin(), uniqueOrientations.end());
 }
 
-// Her parça için tüm geçerli yerleşimleri önceden hesapla
-static void precomputePlacements() {
-    for (int p = 0; p < NUM_PIECES; ++p) {
-        // Base shape'i parse et
-        auto baseCoords = parseShape(pieceShapes[p]);
-        // Bütün benzersiz oryantasyonları al
-        auto orientations = generateOrientations(baseCoords);
+// Precompute all legal placements for every piece in all orientations
+static void precomputeAllPiecePlacements() {
+    for (int pieceIdx = 0; pieceIdx < TOTAL_PIECES; ++pieceIdx) {
+        auto baseCoords = parsePieceShape(basePieceShapes[pieceIdx]);
+        auto allOrientations = generateUniqueOrientations(baseCoords);
 
-        // Her oryantasyon için tüm kaydırmaları dene
-        for (const auto &shape : orientations) {
-            // Oriented shape'in genişlik ve yüksekliğini bul
+        for (const auto &shape : allOrientations) {
             int maxX = 0, maxY = 0;
-            for (size_t i = 0; i < shape.size(); ++i) {
-                int x = shape[i].first;
-                int y = shape[i].second;
-                maxX = std::max(maxX, x);
-                maxY = std::max(maxY, y);
+            for (const auto &coord : shape) {
+                maxX = std::max(maxX, coord.first);
+                maxY = std::max(maxY, coord.second);
             }
-            int shapeW = maxX + 1;
-            int shapeH = maxY + 1;
+            int shapeWidth = maxX + 1;
+            int shapeHeight = maxY + 1;
 
-            // Tahtanın içinde kaydırarak yerleştir
-            for (int oy = 0; oy <= BOARD_HEIGHT - shapeH; ++oy) {
-                for (int ox = 0; ox <= BOARD_WIDTH  - shapeW; ++ox) {
-                    uint64_t mask = 0ULL;
-                    std::vector<int> cells;
-                    bool valid = true;
-                    for (size_t i = 0; i < shape.size(); ++i) {
-                        int x = ox + shape[i].first;
-                        int y = oy + shape[i].second;
-                        int idx = y * BOARD_WIDTH + x;
-                        if (idx < 0 || idx >= NUM_CELLS) {
-                            valid = false;
+            for (int yOffset = 0; yOffset <= BOARD_HEIGHT - shapeHeight; ++yOffset) {
+                for (int xOffset = 0; xOffset <= BOARD_WIDTH - shapeWidth; ++xOffset) {
+                    uint64_t placementMask = 0ULL;
+                    std::vector<int> cellIndices;
+                    bool validPlacement = true;
+                    for (const auto &coord : shape) {
+                        int x = xOffset + coord.first;
+                        int y = yOffset + coord.second;
+                        int cellIdx = y * BOARD_WIDTH + x;
+                        if (cellIdx < 0 || cellIdx >= TOTAL_CELLS) {
+                            validPlacement = false;
                             break;
                         }
-                        mask |= (1ULL << idx);
-                        cells.push_back(idx);
+                        placementMask |= (1ULL << cellIdx);
+                        cellIndices.push_back(cellIdx);
                     }
-                    if (!valid) continue;
-                    // Geçerli yerleşimi kaydet
-                    int placementIndex = placementMasks[p].size();
-                    placementMasks[p].push_back(mask);
-                    placementCells[p].push_back(cells);
-                    // placementsByCell[p][c] vektörüne ekle
-                    for (size_t j = 0; j < cells.size(); ++j) {
-                        int idx = cells[j];
-                        placementsByCell[p][idx].push_back(placementIndex);
+                    if (!validPlacement) continue;
+                    int placementIdx = piecePlacementMasks[pieceIdx].size();
+                    piecePlacementMasks[pieceIdx].push_back(placementMask);
+                    piecePlacementCells[pieceIdx].push_back(cellIndices);
+                    for (int cell : cellIndices) {
+                        piecePlacementsByCell[pieceIdx][cell].push_back(placementIdx);
                     }
                 }
             }
@@ -155,57 +126,44 @@ static void precomputePlacements() {
     }
 }
 
-// Düğüme dayalı geri izleme (backtracking):
-// Mevcut boardMask, hangi parçaların kullanıldığı (used[]), ve boardChars tamponu
-// çözümleri solutions vektörüne ekler.
-static void search(
-    uint64_t boardMask,
-    std::array<bool, NUM_PIECES> &used,
-    BoardChars &boardChars,
-    std::vector<BoardChars> &solutions
+// Recursive backtracking search to find valid solutions
+static void recursiveSolver(
+    uint64_t currentBoardMask,
+    std::array<bool, TOTAL_PIECES> &usedPieces,
+    BoardRepresentation &currentBoard,
+    std::vector<BoardRepresentation> &foundSolutions
 ) {
-    // Tüm parçalar kullanıldı mı?
-    bool done = true;
-    for (int i = 0; i < NUM_PIECES; ++i) {
-        if (!used[i]) {
-            done = false;
-            break;
-        }
-    }
-    if (done) {
-        solutions.push_back(boardChars);
+    // Base case: all pieces placed
+    if (std::all_of(usedPieces.begin(), usedPieces.end(), [](bool used) { return used; })) {
+        foundSolutions.push_back(currentBoard);
         return;
     }
 
-    // İlk boş hücreyi bul (bit = 0)
-    int c = 0;
-    while (c < NUM_CELLS && ((boardMask >> c) & 1ULL)) {
-        ++c;
+    // Find the first empty cell
+    int firstEmptyCell = 0;
+    while (firstEmptyCell < TOTAL_CELLS && ((currentBoardMask >> firstEmptyCell) & 1ULL)) {
+        ++firstEmptyCell;
     }
-    if (c >= NUM_CELLS) return; // Tüm hücreler dolu ama parçalar bitmedi => çık
+    if (firstEmptyCell >= TOTAL_CELLS) return;
 
-    // c hücresini kapsayan her kullanılmamış parçayı dene
-    for (int p = 0; p < NUM_PIECES; ++p) {
-        if (used[p]) continue;
-        // Bu parça için c hücresini kapsayan tüm yerleşim-indeksleri
-        for (int idx : placementsByCell[p][c]) {
-            uint64_t pmask = placementMasks[p][idx];
-            // Örtüşme var mı?
-            if ((pmask & boardMask) != 0ULL) continue;
-            // Parçayı yerleştir
-            used[p] = true;
-            uint64_t newMask = boardMask | pmask;
-            for (size_t j = 0; j < placementCells[p][idx].size(); ++j) {
-                int cell = placementCells[p][idx][j];
-                boardChars[cell] = char('A' + p);
+    // Try all unused pieces that can cover the current cell
+    for (int pieceIdx = 0; pieceIdx < TOTAL_PIECES; ++pieceIdx) {
+        if (usedPieces[pieceIdx]) continue;
+        for (int placementIdx : piecePlacementsByCell[pieceIdx][firstEmptyCell]) {
+            uint64_t placementMask = piecePlacementMasks[pieceIdx][placementIdx];
+            if ((placementMask & currentBoardMask) != 0ULL) continue;
+
+            // Place the piece
+            usedPieces[pieceIdx] = true;
+            uint64_t newMask = currentBoardMask | placementMask;
+            for (int cell : piecePlacementCells[pieceIdx][placementIdx]) {
+                currentBoard[cell] = char('A' + pieceIdx);
             }
-            // Rekürsif çağrı
-            search(newMask, used, boardChars, solutions);
-            // Geri al (backtrack)
-            used[p] = false;
-            for (size_t j = 0; j < placementCells[p][idx].size(); ++j) {
-                int cell = placementCells[p][idx][j];
-                boardChars[cell] = '.';
+            recursiveSolver(newMask, usedPieces, currentBoard, foundSolutions);
+            // Backtrack
+            usedPieces[pieceIdx] = false;
+            for (int cell : piecePlacementCells[pieceIdx][placementIdx]) {
+                currentBoard[cell] = '.';
             }
         }
     }
@@ -213,121 +171,93 @@ static void search(
 
 int main(int argc, char **argv) {
     MPI_Init(&argc, &argv);
+    int totalRanks, rankId;
+    MPI_Comm_size(MPI_COMM_WORLD, &totalRanks);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rankId);
 
-    int world_size = 1, world_rank = 0;
-    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
-    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
-
-    // Zaman ölçümü başlat
     double startTime = MPI_Wtime();
+    precomputeAllPiecePlacements();
 
-    // Tüm parçalar için yerleşimleri önceden hesapla (tüm ranklerde)
-    precomputePlacements();
+    int totalStartingPlacements = piecePlacementMasks[0].size();
+    std::vector<BoardRepresentation> localSolutions;
+    BoardRepresentation initialBoard;
+    initialBoard.fill('.');
+    std::array<bool, TOTAL_PIECES> initialUsed;
+    initialUsed.fill(false);
 
-    // Parça 0 (A) yerleşim sayısı
-    int totalPlacements0 = static_cast<int>(placementMasks[0].size());
-
-    // Bu rank'in bulduğu çözümler
-    std::vector<BoardChars> localSolutions;
-
-    // Boş tahta karakter tamponu ('.' ile doldurulmuş)
-    BoardChars boardCharsInit;
-    boardCharsInit.fill('.');
-
-    // Hangi parçalar kullanıldı?
-    std::array<bool, NUM_PIECES> usedInit;
-    usedInit.fill(false);
-
-    // Her rank, parça 0'ın farklı indekslerini işlesin: i0 = rank, rank + world_size, ...
-    for (int i0 = world_rank; i0 < totalPlacements0; i0 += world_size) {
-        // Her iterasyonda tahtayı temizle
-        BoardChars boardChars = boardCharsInit;
-        auto used = usedInit;
-        uint64_t boardMask = 0ULL;
-
-        // Parça 0'ı i0 konumunda yerleştir
+    // Distribute first-piece placements among MPI ranks
+    for (int i = rankId; i < totalStartingPlacements; i += totalRanks) {
+        BoardRepresentation currentBoard = initialBoard;
+        auto used = initialUsed;
+        uint64_t currentMask = piecePlacementMasks[0][i];
         used[0] = true;
-        boardMask = placementMasks[0][i0];
-        for (size_t j = 0; j < placementCells[0][i0].size(); ++j) {
-            int cell = placementCells[0][i0][j];
-            boardChars[cell] = 'A';
+        for (int cell : piecePlacementCells[0][i]) {
+            currentBoard[cell] = 'A';
         }
-
-        // Kalan parçaları arama
-        search(boardMask, used, boardChars, localSolutions);
-        // Bir sonraki i0 için aynı başlangıç adımları yeniden oluşturulacak
+        recursiveSolver(currentMask, used, currentBoard, localSolutions);
     }
 
-    // Şimdi local çözümleri rank 0'a toplayalım
-    int localCount = static_cast<int>(localSolutions.size());
-    std::vector<int> allCounts;
-    if (world_rank == 0) {
-        allCounts.resize(world_size, 0);
+    // Collect solution counts
+    int localCount = localSolutions.size();
+    std::vector<int> solutionCounts;
+    if (rankId == 0) {
+        solutionCounts.resize(totalRanks);
     }
     MPI_Gather(&localCount, 1, MPI_INT,
-               (world_rank == 0 ? allCounts.data() : nullptr),
-               1, MPI_INT, 0, MPI_COMM_WORLD);
+               solutionCounts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    // localSolutions[i] her biri 55 karakterlik, tüm rank'ların flatten edilmiş hali
-    int localChars = localCount * NUM_CELLS;
-    std::vector<char> localBuf(localChars);
+    // Flatten local solutions to char buffer
+    int localChars = localCount * TOTAL_CELLS;
+    std::vector<char> localBuffer(localChars);
     for (int i = 0; i < localCount; ++i) {
-        std::memcpy(&localBuf[i * NUM_CELLS], localSolutions[i].data(), NUM_CELLS);
+        std::memcpy(&localBuffer[i * TOTAL_CELLS], localSolutions[i].data(), TOTAL_CELLS);
     }
 
-    // Rank 0'de alıcı tamponları ayarla
-    std::vector<int> recvCounts;
-    std::vector<int> displs;
-    std::vector<char> recvBuf;
-    if (world_rank == 0) {
-        recvCounts.resize(world_size);
-        displs.resize(world_size);
+    // Setup receive buffers on rank 0
+    std::vector<int> recvCounts, displacements;
+    std::vector<char> allSolutionsBuffer;
+    if (rankId == 0) {
+        recvCounts.resize(totalRanks);
+        displacements.resize(totalRanks);
         int offset = 0;
-        for (int i = 0; i < world_size; ++i) {
-            recvCounts[i] = allCounts[i] * NUM_CELLS;
-            displs[i]    = offset;
-            offset       += recvCounts[i];
+        for (int i = 0; i < totalRanks; ++i) {
+            recvCounts[i] = solutionCounts[i] * TOTAL_CELLS;
+            displacements[i] = offset;
+            offset += recvCounts[i];
         }
-        recvBuf.resize(offset);
+        allSolutionsBuffer.resize(offset);
     }
 
-    // Her rank'in buffer'ını rank 0'a topla
-    MPI_Gatherv(localBuf.data(), localChars, MPI_CHAR,
-                (world_rank == 0 ? recvBuf.data()    : nullptr),
-                (world_rank == 0 ? recvCounts.data() : nullptr),
-                (world_rank == 0 ? displs.data()     : nullptr),
+    // Gather all boards into rank 0
+    MPI_Gatherv(localBuffer.data(), localChars, MPI_CHAR,
+                allSolutionsBuffer.data(), recvCounts.data(), displacements.data(),
                 MPI_CHAR, 0, MPI_COMM_WORLD);
 
-    // Rank 0 tüm çözümleri "solutions.txt" dosyasına yazsın
-    if (world_rank == 0) {
-        std::ofstream ofs("solutions.txt");
-        if (!ofs.is_open()) {
-            std::cerr << "Hata: solutions.txt açılamadı\n";
+    // Output results to file from rank 0
+    if (rankId == 0) {
+        std::ofstream outputFile("solutions.txt");
+        if (!outputFile.is_open()) {
+            std::cerr << "Error: Could not open solutions.txt\n";
         } else {
-            int totalSolutions = std::accumulate(allCounts.begin(), allCounts.end(), 0);
-            for (int r = 0; r < world_size; ++r) {
-                int count = allCounts[r];
+            int totalSolutions = std::accumulate(solutionCounts.begin(), solutionCounts.end(), 0);
+            for (int r = 0; r < totalRanks; ++r) {
+                int count = solutionCounts[r];
                 for (int s = 0; s < count; ++s) {
-                    // Bir çözüme ait 55 karaktere işaret eden pointer
-                    const char *boardPtr = recvBuf.data() + displs[r] + s * NUM_CELLS;
-                    // 5 satır × 11 sütun yaz
+                    const char *boardData = allSolutionsBuffer.data() + displacements[r] + s * TOTAL_CELLS;
                     for (int row = 0; row < BOARD_HEIGHT; ++row) {
-                        ofs.write(boardPtr + row * BOARD_WIDTH, BOARD_WIDTH);
-                        ofs.put('\n');
+                        outputFile.write(boardData + row * BOARD_WIDTH, BOARD_WIDTH);
+                        outputFile.put('\n');
                     }
-                    ofs.put('\n');
+                    outputFile.put('\n');
                 }
             }
-            ofs.close();
-            std::cout << "Toplam çözüm sayısı: " << totalSolutions << "\n";
+            outputFile.close();
+            std::cout << "Total solutions: " << totalSolutions << "\n";
         }
-
-        // Zaman ölçümünü al
         double endTime = MPI_Wtime();
-        double elapsed = endTime - startTime;
-        std::cout << "Toplam çalışma süresi: " << elapsed << " saniye\n";
+        std::cout << "Elapsed time: " << (endTime - startTime) << " seconds\n";
     }
 
     MPI_Finalize();
     return 0;
-} 
+}

@@ -1,0 +1,2 @@
+Total solutions: 4331140
+Elapsed time: 300.528 seconds
